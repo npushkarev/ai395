@@ -79,6 +79,26 @@ ensure_tools_venv() {
   uv pip install -q --python "$TOOLS_VENV/bin/python" "huggingface_hub[cli,hf_xet]" gguf numpy
 }
 
+
+# hf download с понятным прогрессом: «скачано X из Y ГиБ · скорость · осталось ~N мин» раз в 20 с.
+# Ctrl+C останавливает и загрузку (фоновые процессы скрипта SIGINT сами не получают).
+hf_get() {
+  local repo=$1; shift
+  HF_HUB_DISABLE_PROGRESS_BARS=1 "$TOOLS_VENV/bin/hf" download "$repo" "$@" --local-dir "$MODEL_DIR" &
+  local dl=$!
+  mkdir -p "$AI_HOME/logs"
+  DL_STATUS_FILE="$AI_HOME/logs/download.status" \
+    "$TOOLS_VENV/bin/python" "$SCRIPT_DIR/dl_progress.py" "$repo" "$MODEL_DIR" "$dl" "$@" &
+  local mon=$!
+  trap "kill $dl $mon 2>/dev/null; echo; echo 'прервано — запусти ещё раз, докачает'; exit 130" INT TERM
+  local rc=0
+  wait "$dl" || rc=$?
+  kill "$mon" 2>/dev/null; wait "$mon" 2>/dev/null || true
+  trap - INT TERM
+  rm -f "$AI_HOME/logs/download.status"
+  ((rc == 0)) || die "загрузка $repo прервалась (код $rc) — запусти ещё раз, докачает"
+}
+
 # Какую модель держит halogen: выбор из ./halogen-fast.sh важнее конфига
 hg_choice() { cat "$AI_HOME/halogen.choice" 2>/dev/null || echo "$HG_MODEL"; }
 
@@ -252,10 +272,9 @@ do_models() {
   avail_gb=$(df -BG --output=avail "$MODEL_DIR" | tail -1 | tr -dc 0-9)
   (( avail_gb > 120 )) || warn "на $MODEL_DIR свободно ${avail_gb} ГБ — может не хватить (модель + QSA-копия на не-btrfs)"
 
-  local hf="$TOOLS_VENV/bin/hf"
   if [[ ! -f "$MODEL_DIR/$MODEL_FILE" ]]; then
     echo "качаю $MODEL_REPO/$MODEL_FILE (десятки ГБ, можно прервать и перезапустить — докачает)"
-    "$hf" download "$MODEL_REPO" "$MODEL_FILE" --local-dir "$MODEL_DIR"
+    hf_get "$MODEL_REPO" "$MODEL_FILE"
   fi
   ok "основная модель: $MODEL_DIR/$MODEL_FILE"
 
@@ -275,7 +294,7 @@ do_models() {
   fi
 
   if ((MTP)); then
-    [[ -f "$MODEL_DIR/$MTP_FILE" ]] || "$hf" download "$MTP_REPO" "$MTP_FILE" --local-dir "$MODEL_DIR"
+    [[ -f "$MODEL_DIR/$MTP_FILE" ]] || hf_get "$MTP_REPO" "$MTP_FILE"
     if ((MTP_REQUANT)); then
       local m; m=$(mtp_path)
       if [[ ! -f "$m" ]]; then

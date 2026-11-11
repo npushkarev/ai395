@@ -7,6 +7,7 @@
 #   ./halogen-fast.sh download     # только скачать
 #   ./halogen-fast.sh fast         # переключить на быструю (v2)
 #   ./halogen-fast.sh uncensored   # переключить на Uncensored GGUF
+#   ./halogen-fast.sh progress     # сколько осталось докачать (можно из другого терминала)
 #   ./halogen-fast.sh status       # что сейчас крутится
 set -euo pipefail
 
@@ -37,11 +38,32 @@ hf_bin() {
   local hf="$AI_HOME/venv-tools/bin/hf"
   if [[ ! -x "$hf" ]]; then
     export PATH="$HOME/.local/bin:$PATH"
-    command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
-    uv venv -q --python 3.12 "$AI_HOME/venv-tools"
-    uv pip install -q --python "$AI_HOME/venv-tools/bin/python" "huggingface_hub[cli,hf_xet]"
+    {
+      command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+      uv venv -q --python 3.12 "$AI_HOME/venv-tools"
+      uv pip install -q --python "$AI_HOME/venv-tools/bin/python" "huggingface_hub[cli,hf_xet]"
+    } >&2   # stdout этой функции — только путь к hf
   fi
   echo "$hf"
+}
+
+# hf download с понятным прогрессом: «скачано X из Y ГиБ · скорость · осталось ~N мин» раз в 20 с.
+# Ctrl+C останавливает и загрузку (фоновые процессы скрипта SIGINT сами не получают).
+hf_get() {
+  local repo=$1; shift
+  HF_HUB_DISABLE_PROGRESS_BARS=1 "$HF" download "$repo" "$@" --local-dir "$MODEL_DIR" &
+  local dl=$!
+  mkdir -p "$AI_HOME/logs"
+  DL_STATUS_FILE="$AI_HOME/logs/download.status" \
+    "$AI_HOME/venv-tools/bin/python" "$SCRIPT_DIR/dl_progress.py" "$repo" "$MODEL_DIR" "$dl" "$@" &
+  local mon=$!
+  trap "kill $dl $mon 2>/dev/null; echo; echo 'прервано — запусти ещё раз, докачает'; exit 130" INT TERM
+  local rc=0
+  wait "$dl" || rc=$?
+  kill "$mon" 2>/dev/null; wait "$mon" 2>/dev/null || true
+  trap - INT TERM
+  rm -f "$AI_HOME/logs/download.status"
+  ((rc == 0)) || die "загрузка $repo прервалась (код $rc) — запусти ещё раз, докачает"
 }
 
 download() {
@@ -55,7 +77,8 @@ download() {
   fi
   [[ -s "$HOME/.cache/huggingface/token" ]] || warn "нет HF-токена (~/.cache/huggingface/token) — будет медленнее"
   echo "качаю $HG_WEIGHTS_REPO (~$(( NEED_GIB - have_gib )) ГиБ осталось; можно прервать Ctrl+C — докачает)…"
-  "$(hf_bin)" download "$HG_WEIGHTS_REPO" "${FILES[@]}" --local-dir "$MODEL_DIR"
+  HF=$(hf_bin)
+  hf_get "$HG_WEIGHTS_REPO" "${FILES[@]}"
   ok "быстрая модель скачана в $MODEL_DIR"
 }
 
@@ -84,5 +107,14 @@ case "${1:-all}" in
   fast)       switch fast ;;
   uncensored) switch uncensored ;;
   status)     status ;;
-  *) sed -n '2,11p' "$0"; exit 2 ;;
+  progress)
+    # Пока идёт загрузка (в этом или другом терминале), её индикатор пишет последнюю строку в файл
+    st="$AI_HOME/logs/download.status"
+    if [[ -s "$st" ]] && pgrep -f 'hf download' >/dev/null; then
+      cat "$st"
+    else
+      hf_bin >/dev/null
+      "$AI_HOME/venv-tools/bin/python" "$SCRIPT_DIR/dl_progress.py" "$HG_WEIGHTS_REPO" "$MODEL_DIR" 0 "${FILES[@]}"
+    fi ;;
+  *) sed -n '2,12p' "$0"; exit 2 ;;
 esac

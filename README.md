@@ -44,7 +44,11 @@ halogen открывает GGUF без конвертации; mradermacher `i1-
 ./halogen-fast.sh uncensored  # обратно на Uncensored GGUF
 ./halogen-fast.sh fast        # снова на быструю
 ./halogen-fast.sh status
+./halogen-fast.sh progress    # сколько осталось докачать — можно из другого терминала
 ```
+
+Во время любой загрузки модели раз в 20 с печатается строка вида
+`⏬ скачано 23.4 из 111.4 ГиБ (21.0%) · 85.0 МБ/с · осталось ~17 мин`.
 
 | | Uncensored GGUF | v2 (быстрая) |
 |---|---|---|

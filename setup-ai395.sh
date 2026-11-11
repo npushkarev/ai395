@@ -3,10 +3,11 @@
 # Ubuntu 24.04+/26.04. Запускать обычным пользователем с sudo, НЕ от root.
 #
 #   ./setup-ai395.sh                 # всё по порядку
-#   ./setup-ai395.sh llama halo-coder # отдельные шаги
+#   ./setup-ai395.sh models halogen  # отдельные шаги
 #   ./setup-ai395.sh verify
 #
-# Шаги: system docker llama models halo-coder ollama pytorch verify
+# Шаги: system docker llama models halogen halo-coder ollama pytorch verify
+# По умолчанию движок — halogen (ENGINE=halogen), halo-coder на llama.cpp — запасной (ENGINE=llama).
 # Каждый шаг можно перезапускать: уже сделанное он пропустит.
 set -euo pipefail
 
@@ -19,7 +20,9 @@ eval "$_env_saved"; unset _env_saved
 
 # Значения по умолчанию, если конфига нет
 : "${AI_HOME:=$HOME/ai395}" "${MODEL_DIR:=$HOME/models/qwen38unc}" "${OLLAMA_MODELS_DIR=}"
-: "${GTT_RESERVE_GB:=8}" "${SWAP_GB:=32}" "${DISABLE_ZSWAP:=1}"
+: "${AMD_IOMMU_OFF:=1}" "${SWAP_GB:=32}" "${DISABLE_ZSWAP:=1}" "${ENGINE:=halogen}"
+: "${HG_IMAGE:=ghcr.io/peonist-ai/halogen-flash-server:0.20.1}" "${HG_PUBLISH:=0.0.0.0:8731}" "${HG_API_KEY:=1}"
+: "${HG_WEIGHTS_REPO:=peonist-ai/halogen-qwen3.8-flash-next}" "${HG_EXTRA_ENV:=}"
 : "${LLAMA_REPO:=https://github.com/ggml-org/llama.cpp.git}" "${LLAMA_REF:=b11627}"
 : "${MODEL_REPO:=mradermacher/Qwen3.8-Flash-Next-Uncensored-i1-GGUF}"
 : "${MODEL_FILE:=Qwen3.8-Flash-Next-Uncensored.i1-IQ4_XS.gguf}"
@@ -82,7 +85,7 @@ mem_total_kb() { awk '/^MemTotal:/ {print $2}' /proc/meminfo; }
 do_system() {
   step "Система"
   sudo apt-get update -q
-  apt_install build-essential cmake ninja-build git git-lfs ccache pkg-config curl ca-certificates \
+  apt_install build-essential cmake ninja-build git git-lfs ccache pkg-config curl ca-certificates openssl \
               libcurl4-openssl-dev libssl-dev python3 python3-venv jq htop nvtop pciutils \
               mesa-vulkan-drivers vulkan-tools libvulkan-dev glslc spirv-headers \
               linux-firmware radeontop power-profiles-daemon
@@ -94,11 +97,14 @@ do_system() {
   done
 
   # Память iGPU. На Strix Halo VRAM — это кусок ОЗУ. Всё, что не carveout из BIOS, iGPU берёт
-  # динамически через GTT, лимит которого задаёт ttm.pages_limit (страницы по 4 КиБ).
+  # динамически через GTT. Набор флагов — тот, на котором мерил halogen-flash-server
+  # (docs/troubleshooting.md), размеры GTT считаются от ОЗУ этой машины, а не копируются.
   local total_kb pages params
   total_kb=$(mem_total_kb)
-  pages=$(( (total_kb - GTT_RESERVE_GB * 1024 * 1024) / 4 ))
-  params="ttm.pages_limit=$pages ttm.page_pool_size=$pages iommu=pt"
+  pages=$(( total_kb / 4 ))
+  params="amdgpu.vm_update_mode=0 amdgpu.noretry=0 amdgpu.sg_display=0"
+  params+=" amdgpu.gttsize=$(( total_kb / 1024 )) ttm.pages_limit=$pages ttm.page_pool_size=$pages"
+  if ((AMD_IOMMU_OFF)); then params+=" amd_iommu=off"; else params+=" iommu=pt"; fi
   ((DISABLE_ZSWAP)) && params+=" zswap.enabled=0"
   local cfg=/etc/default/grub.d/90-ai395.cfg
   local want="GRUB_CMDLINE_LINUX_DEFAULT=\"\$GRUB_CMDLINE_LINUX_DEFAULT $params\""
@@ -246,6 +252,11 @@ do_models() {
   fi
   ok "основная модель: $MODEL_DIR/$MODEL_FILE"
 
+  if [[ "$ENGINE" != llama ]]; then
+    ok "для halogen хватит исходного GGUF: QSA-копия и MTP-голова llama.cpp не нужны"
+    return 0
+  fi
+
   if ((QSA)); then
     local q; q=$(model_path)
     if [[ ! -f "$q" ]]; then
@@ -276,6 +287,10 @@ do_models() {
 # ── 5. halo-coder: llama-server как системная служба ─────────────────
 do_halo_coder() {
   step "halo-coder"
+  if have docker && sudo docker inspect halogen >/dev/null 2>&1; then
+    warn "останавливаю halogen: вдвоём с halo-coder память не поделят"
+    sudo docker update --restart=no halogen >/dev/null; sudo docker stop halogen >/dev/null || true
+  fi
   local server="$BIN_DIR/llama-current/llama-server"
   [[ -x "$server" ]] || do_llama
   local model; model=$(model_path)
@@ -394,6 +409,71 @@ EOF
   warn "за 10 минут не поднялся — смотри: tail -f $LOG_DIR/halo-coder.log"
 }
 
+# ── 5a. halogen-flash-server на Uncensored GGUF ──────────────────────
+do_halogen() {
+  step "halogen-flash-server ($HG_IMAGE)"
+  have docker || do_docker
+  [[ -f "$MODEL_DIR/$MODEL_FILE" ]] || do_models
+
+  if systemctl is-enabled -q halo-coder 2>/dev/null; then
+    warn "выключаю halo-coder: вдвоём с halogen память не поделят"
+    sudo systemctl disable --now halo-coder halo-coder-watchdog.timer 2>/dev/null || true
+  fi
+
+  # Ядро: нужны фиксы KFD под gfx1151 и CONFIG_HSA_AMD_SVM (иначе регистрация весов отказывает)
+  local node props cap
+  for node in /sys/class/kfd/kfd/topology/nodes/*; do
+    grep -q 'gfx_target_version 110501' "$node/properties" 2>/dev/null || continue
+    props="$node/properties"
+  done
+  if [[ -n "${props:-}" ]]; then
+    cap=$(awk '$1=="capability"{print $2}' "$props")
+    (( cap & 0x08000000 )) && ok "ядро: KFD SVM есть" || warn "ядро собрано без CONFIG_HSA_AMD_SVM — halogen не загрузит веса"
+    grep -q '^cwsr_size' "$props" && ok "ядро: фиксы gfx1151 есть" || warn "в ядре нет фиксов KFD для gfx1151 (нужно ≥ 6.18.4 / Ubuntu 7.0)"
+  else
+    warn "KFD-узел gfx1151 не найден — проверь /dev/kfd и группу render"
+  fi
+
+  local env_args=(
+    -e "HALOGEN_CHECKPOINT=/models/$MODEL_FILE"
+    -e "HALOGEN_DOWNLOAD=$HG_WEIGHTS_REPO"     # только драфт-голова и токенайзер, GGUF не качает
+  )
+  if ((HG_API_KEY)); then
+    local keyf="$AI_HOME/halogen.key"
+    [[ -s "$keyf" ]] || { (umask 077; openssl rand -hex 24 >"$keyf"); }
+    chmod 644 "$keyf"   # контейнер читает его своим пользователем
+    env_args+=(-e HALOGEN_API_KEY_FILE=/run/halogen.key -v "$keyf:/run/halogen.key:ro")
+  fi
+  local kv
+  for kv in $HG_EXTRA_ENV; do env_args+=(-e "$kv"); done
+
+  sudo docker pull -q "$HG_IMAGE"
+  sudo docker rm -f halogen >/dev/null 2>&1 || true
+  # Том моделей rw: первый старт докладывает в него драфт-голову (qwen38-flash-next-mtp.hgn)
+  sudo docker run -d --name halogen --restart unless-stopped \
+    -p "$HG_PUBLISH:8731" \
+    --device /dev/kfd --device /dev/dri --group-add video --group-add render \
+    --ipc=host --ulimit memlock=-1:-1 \
+    "${env_args[@]}" \
+    -v "$MODEL_DIR:/models" \
+    "$HG_IMAGE" >/dev/null
+
+  echo "жду готовности (первый старт качает 1.4 ГиБ и переупаковывает GGUF, до 10 минут)…"
+  local i
+  for i in $(seq 1 120); do
+    if curl -sf -m 5 http://127.0.0.1:8731/health >/dev/null; then
+      ok "halogen готов: http://$(hostname -I | awk '{print $1}'):8731/v1 (OpenAI) и /v1/messages (Anthropic)"
+      ((HG_API_KEY)) && ok "API-ключ: $AI_HOME/halogen.key"
+      sudo docker logs halogen 2>&1 | grep -m2 'host memory left\|checkpoint_format' || true
+      return 0
+    fi
+    [[ "$(sudo docker inspect -f '{{.State.Running}}' halogen 2>/dev/null)" == true ]] \
+      || { sudo docker logs --tail 40 halogen; die "halogen упал при старте"; }
+    sleep 5
+  done
+  warn "за 10 минут не поднялся — смотри: sudo docker logs -f halogen"
+}
+
 # ── 6. Ollama ────────────────────────────────────────────────────────
 do_ollama() {
   step "Ollama"
@@ -424,8 +504,7 @@ EOF
   local m
   for m in $OLLAMA_PULL; do ollama pull "$m"; done
   ok "ollama: http://$OLLAMA_BIND  (модели: ${OLLAMA_MODELS_DIR:-/usr/share/ollama/.ollama/models})"
-  warn "halo-coder занимает ~90+ ГБ. Крупные модели в ollama параллельно с ним не влезут —"
-  warn "при нехватке памяти ядро убьёт ollama (у halo-coder OOMScoreAdjust=-500)."
+  warn "halogen/halo-coder занимают ~90 ГБ: в ollama параллельно — только небольшие модели."
 }
 
 # ── 7. PyTorch ROCm под gfx1151 ──────────────────────────────────────
@@ -471,6 +550,11 @@ do_verify() {
   have vulkaninfo && vulkaninfo --summary 2>/dev/null | grep -E "deviceName|driverName" | sed 's/^ */vulkan: /'
   have rocminfo && rocminfo 2>/dev/null | grep -m1 -o "gfx1151" | sed 's/^/rocm: /'
   echo "группы: $(id -nG)"
+  if have docker && [[ "$(sudo docker inspect -f '{{.State.Running}}' halogen 2>/dev/null)" == true ]]; then
+    echo "halogen: $(curl -s -m 5 http://127.0.0.1:8731/health | head -c 300)"
+  else
+    echo "halogen: не запущен"
+  fi
   systemctl is-active -q halo-coder && curl -sf -m 5 "http://127.0.0.1:$HC_PORT/v1/models" | jq -r '.data[].id' | sed 's/^/halo-coder: /' || echo "halo-coder: не запущен"
   systemctl is-active -q ollama && echo "ollama: $(ollama --version 2>/dev/null | tail -1)" || echo "ollama: не запущен"
   [[ -x "$TORCH_VENV/bin/python" ]] && "$TORCH_VENV/bin/python" -c "import torch;print('torch:', torch.__version__, torch.cuda.is_available())" 2>/dev/null || true
@@ -480,15 +564,18 @@ do_verify() {
 # ── main ─────────────────────────────────────────────────────────────
 main() {
   local steps=("$@")
-  ((${#steps[@]})) || steps=(system docker llama models halo-coder ollama pytorch verify)
+  if ((${#steps[@]} == 0)); then
+    local engine_step=halogen; [[ "$ENGINE" == llama ]] && engine_step=halo-coder
+    steps=(system docker llama models "$engine_step" ollama pytorch verify)
+  fi
   preflight
   exec > >(tee -a "$LOG_DIR/setup-$(date +%F).log") 2>&1
   local s
   for s in "${steps[@]}"; do
     case "$s" in
       system) do_system ;; docker) do_docker ;; llama) do_llama ;; models) do_models ;;
-      halo-coder) do_halo_coder ;; ollama) do_ollama ;; pytorch) do_pytorch ;; verify) do_verify ;;
-      *) die "неизвестный шаг «$s». Есть: system docker llama models halo-coder ollama pytorch verify" ;;
+      halogen) do_halogen ;; halo-coder) do_halo_coder ;; ollama) do_ollama ;; pytorch) do_pytorch ;; verify) do_verify ;;
+      *) die "неизвестный шаг «$s». Есть: system docker llama models halogen halo-coder ollama pytorch verify" ;;
     esac
   done
   if ((REBOOT_NEEDED)); then

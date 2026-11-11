@@ -413,7 +413,17 @@ EOF
 do_halogen() {
   step "halogen-flash-server ($HG_IMAGE)"
   have docker || do_docker
-  [[ -f "$MODEL_DIR/$MODEL_FILE" ]] || do_models
+  # Какую модель держит halogen: uncensored (GGUF, по умолчанию) или fast (чекпоинт v2, ./halogen-fast.sh)
+  local choice ckpt
+  choice=$(cat "$AI_HOME/halogen.choice" 2>/dev/null || echo uncensored)
+  if [[ "$choice" == fast ]]; then
+    ckpt="/models/qwen38-flash-next-v2.hgn"
+    [[ -f "$MODEL_DIR/qwen38-flash-next-v2.hgn" ]] || die "быстрая модель не скачана: ./halogen-fast.sh download"
+  else
+    ckpt="/models/$MODEL_FILE"
+    [[ -f "$MODEL_DIR/$MODEL_FILE" ]] || do_models
+  fi
+  ok "модель: $choice ($ckpt)"
 
   if systemctl is-enabled -q halo-coder 2>/dev/null; then
     warn "выключаю halo-coder: вдвоём с halogen память не поделят"
@@ -435,7 +445,7 @@ do_halogen() {
   fi
 
   local env_args=(
-    -e "HALOGEN_CHECKPOINT=/models/$MODEL_FILE"
+    -e "HALOGEN_CHECKPOINT=$ckpt"
     -e "HALOGEN_DOWNLOAD=$HG_WEIGHTS_REPO"     # только драфт-голова и токенайзер, GGUF не качает
   )
   if ((HG_API_KEY)); then

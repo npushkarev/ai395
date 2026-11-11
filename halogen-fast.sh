@@ -72,7 +72,7 @@ switch() {
 }
 
 status() {
-  echo "выбор: $(cat "$CHOICE_FILE" 2>/dev/null || echo uncensored)"
+  echo "выбор: $(cat "$CHOICE_FILE" 2>/dev/null || echo "${HG_MODEL:-fast} (из конфига)")"
   ls -lh "$MODEL_DIR"/*.hgn "$MODEL_DIR"/*.gguf 2>/dev/null | awk '{print "  "$5"\t"$9}'
   echo "диск: $(df -h --output=avail "$MODEL_DIR" | tail -1) свободно"
   curl -s -m 5 http://127.0.0.1:8731/health | head -c 400; echo

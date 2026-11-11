@@ -10,7 +10,7 @@
 | `nosleep` | ПК не засыпает: сон замаскирован в systemd, logind и GNOME не усыпляют по простою (`./nosleep.sh --undo` — вернуть) |
 | `docker` | Docker + обёртка `docker-gpu` (контейнер с `/dev/kfd` и `/dev/dri`) |
 | `llama` | llama.cpp, статическая сборка с Vulkan |
-| `models` | Qwen3.8-Flash-Next-Uncensored i1-IQ4_XS (без цензуры); для llama.cpp ещё MTP-голова и патч QSA на копии весов |
+| `models` | по умолчанию — быстрый чекпоинт halogen v2 (~111 ГиБ); при `HG_MODEL=uncensored` — Qwen3.8-Flash-Next-Uncensored i1-IQ4_XS |
 | `halogen` | **движок по умолчанию.** [halogen-flash-server](https://github.com/peonist-ai/halogen-flash-server) в Docker на Uncensored GGUF: OpenAI + Anthropic API на `:8731`, API-ключ |
 | `halo-coder` | запасной движок: llama-server как systemd-служба (`127.0.0.1:8088`), автоперезапуск, защита от OOM-killer, сторож зависаний |
 | `ollama` | Ollama через Vulkan, KV q8_0, flash attention |
@@ -37,7 +37,7 @@ halogen открывает GGUF без конвертации; mradermacher `i1-
 с драфт-головой). Драфт-голова у halogen своя, обучена на базовой модели — на Uncensored принимается
 может чуть реже.
 
-### Быстрая модель (с цензурой)
+### Модель: быстрая (по умолчанию) или без цензуры
 
 ```bash
 ./halogen-fast.sh             # скачать собственный чекпоинт halogen v2 (~111 ГиБ) и переключиться на него

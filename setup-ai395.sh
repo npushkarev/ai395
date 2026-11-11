@@ -22,7 +22,7 @@ eval "$_env_saved"; unset _env_saved
 : "${AI_HOME:=$HOME/ai395}" "${MODEL_DIR:=$HOME/models/qwen38unc}" "${OLLAMA_MODELS_DIR=}"
 : "${AMD_IOMMU_OFF:=1}" "${SWAP_GB:=32}" "${DISABLE_ZSWAP:=1}" "${ENGINE:=halogen}"
 : "${HG_IMAGE:=ghcr.io/peonist-ai/halogen-flash-server:0.20.1}" "${HG_PUBLISH:=0.0.0.0:8731}" "${HG_API_KEY:=1}"
-: "${HG_WEIGHTS_REPO:=peonist-ai/halogen-qwen3.8-flash-next}" "${HG_EXTRA_ENV:=}"
+: "${HG_WEIGHTS_REPO:=peonist-ai/halogen-qwen3.8-flash-next}" "${HG_EXTRA_ENV:=}" "${HG_MODEL:=fast}"
 : "${LLAMA_REPO:=https://github.com/ggml-org/llama.cpp.git}" "${LLAMA_REF:=b11627}"
 : "${MODEL_REPO:=mradermacher/Qwen3.8-Flash-Next-Uncensored-i1-GGUF}"
 : "${MODEL_FILE:=Qwen3.8-Flash-Next-Uncensored.i1-IQ4_XS.gguf}"
@@ -78,6 +78,9 @@ ensure_tools_venv() {
   [[ -x "$TOOLS_VENV/bin/python" ]] || uv venv -q --python "$TORCH_PYTHON" "$TOOLS_VENV"
   uv pip install -q --python "$TOOLS_VENV/bin/python" "huggingface_hub[cli,hf_xet]" gguf numpy
 }
+
+# Какую модель держит halogen: выбор из ./halogen-fast.sh важнее конфига
+hg_choice() { cat "$AI_HOME/halogen.choice" 2>/dev/null || echo "$HG_MODEL"; }
 
 mem_total_kb() { awk '/^MemTotal:/ {print $2}' /proc/meminfo; }
 
@@ -239,6 +242,10 @@ mtp_path()   { local f="$MODEL_DIR/$MTP_FILE"; ((MTP_REQUANT)) && f="${f%.gguf}-
 
 do_models() {
   step "Модели"
+  if [[ "$ENGINE" == halogen && "$(hg_choice)" == fast ]]; then
+    "$SCRIPT_DIR/halogen-fast.sh" download   # чекпоинт halogen v2, GGUF не нужен
+    return 0
+  fi
   ensure_tools_venv
   mkdir -p "$MODEL_DIR"
   local avail_gb
@@ -415,7 +422,7 @@ do_halogen() {
   have docker || do_docker
   # Какую модель держит halogen: uncensored (GGUF, по умолчанию) или fast (чекпоинт v2, ./halogen-fast.sh)
   local choice ckpt
-  choice=$(cat "$AI_HOME/halogen.choice" 2>/dev/null || echo uncensored)
+  choice=$(hg_choice)
   if [[ "$choice" == fast ]]; then
     ckpt="/models/qwen38-flash-next-v2.hgn"
     [[ -f "$MODEL_DIR/qwen38-flash-next-v2.hgn" ]] || die "быстрая модель не скачана: ./halogen-fast.sh download"

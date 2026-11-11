@@ -9,7 +9,9 @@
 #   ./halogen-fast.sh uncensored   # переключить на Uncensored GGUF
 #   ./halogen-fast.sh progress     # сколько осталось докачать (можно из другого терминала)
 #   ./halogen-fast.sh status       # что сейчас крутится
-set -euo pipefail
+set -Eeuo pipefail
+# Ни одна ошибка не должна проходить молча: печатаем, где и что упало
+trap 'echo "✗ ошибка: строка $LINENO: $BASH_COMMAND" >&2' ERR
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _env_saved=$(export -p)
@@ -70,7 +72,8 @@ download() {
   mkdir -p "$MODEL_DIR"
   # сколько ещё докачать: размер минус уже лежащее
   local have_gib avail_gib
-  have_gib=$(du -sBG "$MODEL_DIR"/qwen38-flash-next-{v2,ngram}.hgn 2>/dev/null | awk '{s+=$1} END{print s+0}')
+  have_gib=$( (du -scBG "$MODEL_DIR"/qwen38-flash-next-{v2,ngram}.hgn 2>/dev/null || true) | awk '$2=="total"{print $1+0}')
+  have_gib=${have_gib:-0}
   avail_gib=$(df -BG --output=avail "$MODEL_DIR" | tail -1 | tr -dc 0-9)
   if (( avail_gib < NEED_GIB - have_gib + 5 )); then
     die "на диске свободно ${avail_gib} ГиБ, а нужно ещё ~$(( NEED_GIB - have_gib )) ГиБ. Освободи место (например, удали $MODEL_DIR/*.qsa.gguf)."
@@ -96,9 +99,9 @@ switch() {
 
 status() {
   echo "выбор: $(cat "$CHOICE_FILE" 2>/dev/null || echo "${HG_MODEL:-fast} (из конфига)")"
-  ls -lh "$MODEL_DIR"/*.hgn "$MODEL_DIR"/*.gguf 2>/dev/null | awk '{print "  "$5"\t"$9}'
+  (ls -lh "$MODEL_DIR"/*.hgn "$MODEL_DIR"/*.gguf 2>/dev/null || true) | awk '{print "  "$5"\t"$9}'
   echo "диск: $(df -h --output=avail "$MODEL_DIR" | tail -1) свободно"
-  curl -s -m 5 http://127.0.0.1:8731/health | head -c 400; echo
+  curl -s -m 5 http://127.0.0.1:8731/health | head -c 400 || echo "halogen не отвечает"; echo
 }
 
 case "${1:-all}" in

@@ -9,7 +9,9 @@
 # Шаги: system nosleep docker llama models halogen halo-coder ollama pytorch verify
 # По умолчанию движок — halogen (ENGINE=halogen), halo-coder на llama.cpp — запасной (ENGINE=llama).
 # Каждый шаг можно перезапускать: уже сделанное он пропустит.
-set -euo pipefail
+set -Eeuo pipefail
+# Ни одна ошибка не должна проходить молча: печатаем, где и что упало
+trap 'echo "✗ ошибка: строка $LINENO: $BASH_COMMAND" >&2' ERR
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=ai395.conf

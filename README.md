@@ -7,6 +7,7 @@
 | Шаг | Что делает |
 |---|---|
 | `system` | Почти всё ОЗУ отдаётся iGPU через GTT (`ttm.pages_limit`), zswap выключен, swap 32 ГБ, Vulkan (Mesa RADV), группы render/video, профиль питания performance |
+| `nosleep` | ПК не засыпает: сон замаскирован в systemd, logind и GNOME не усыпляют по простою (`./nosleep.sh --undo` — вернуть) |
 | `docker` | Docker + обёртка `docker-gpu` (контейнер с `/dev/kfd` и `/dev/dri`) |
 | `llama` | llama.cpp, статическая сборка с Vulkan |
 | `models` | Qwen3.8-Flash-Next-Uncensored i1-IQ4_XS (без цензуры); для llama.cpp ещё MTP-голова и патч QSA на копии весов |

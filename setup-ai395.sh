@@ -6,7 +6,7 @@
 #   ./setup-ai395.sh models halogen  # отдельные шаги
 #   ./setup-ai395.sh verify
 #
-# Шаги: system docker llama models halogen halo-coder ollama pytorch verify
+# Шаги: system nosleep docker llama models halogen halo-coder ollama pytorch verify
 # По умолчанию движок — halogen (ENGINE=halogen), halo-coder на llama.cpp — запасной (ENGINE=llama).
 # Каждый шаг можно перезапускать: уже сделанное он пропустит.
 set -euo pipefail
@@ -566,16 +566,16 @@ main() {
   local steps=("$@")
   if ((${#steps[@]} == 0)); then
     local engine_step=halogen; [[ "$ENGINE" == llama ]] && engine_step=halo-coder
-    steps=(system docker llama models "$engine_step" ollama pytorch verify)
+    steps=(system nosleep docker llama models "$engine_step" ollama pytorch verify)
   fi
   preflight
   exec > >(tee -a "$LOG_DIR/setup-$(date +%F).log") 2>&1
   local s
   for s in "${steps[@]}"; do
     case "$s" in
-      system) do_system ;; docker) do_docker ;; llama) do_llama ;; models) do_models ;;
+      system) do_system ;; nosleep) "$SCRIPT_DIR/nosleep.sh" ;; docker) do_docker ;; llama) do_llama ;; models) do_models ;;
       halogen) do_halogen ;; halo-coder) do_halo_coder ;; ollama) do_ollama ;; pytorch) do_pytorch ;; verify) do_verify ;;
-      *) die "неизвестный шаг «$s». Есть: system docker llama models halogen halo-coder ollama pytorch verify" ;;
+      *) die "неизвестный шаг «$s». Есть: system nosleep docker llama models halogen halo-coder ollama pytorch verify" ;;
     esac
   done
   if ((REBOOT_NEEDED)); then

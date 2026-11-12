@@ -141,6 +141,14 @@ mem_total_kb() { awk '/^MemTotal:/ {print $2}' /proc/meminfo; }
 
 container_status() { sudo docker inspect -f '{{.State.Status}}' halogen 2>/dev/null || true; }
 
+# docker pull с видимым ходом: по строке на каждый скачанный и распакованный слой (26 слоёв, ~0.9 ГиБ)
+pull_image() {
+  if sudo docker image inspect "$HG_IMAGE" >/dev/null 2>&1; then return 0; fi
+  echo "качаю образ $HG_IMAGE (~0.9 ГиБ, на 5 МБ/с — минуты 3–4; ниже по строке на каждый готовый слой)…"
+  sudo docker pull "$HG_IMAGE" 2>&1 | { grep --line-buffered -E 'Download complete|Pull complete|Status:|Digest:|rror' || true; }
+  sudo docker image inspect "$HG_IMAGE" >/dev/null 2>&1   # итог — есть ли образ, а не что напечатал pull
+}
+
 # ── 1. система: пакеты, драйвер, память iGPU, swap, группы ───────────
 make_swapfile() {
   local f=$1
@@ -293,7 +301,7 @@ EOF
 
   # Образ halogen тянем сразу (0.9 ГиБ): проблемы с сетью до ghcr.io всплывут до многочасовой загрузки моделей
   if [[ "$ENGINE" == halogen ]]; then
-    if sudo docker pull -q "$HG_IMAGE" >/dev/null; then ok "образ halogen скачан: $HG_IMAGE"
+    if pull_image; then ok "образ halogen скачан: $HG_IMAGE"
     else warn "не удалось скачать $HG_IMAGE (сеть до ghcr.io?) — попробую ещё раз на шаге halogen"; fi
   fi
   ok "docker готов; GPU в контейнер: $BIN_DIR/docker-gpu <образ> (нужен перелогин для группы docker)"
@@ -622,9 +630,7 @@ do_halogen() {
   if [[ "$cur" == "$cfg_hash running" ]]; then
     ok "halogen уже работает с этой конфигурацией — не перезапускаю"
   else
-    if ! sudo docker image inspect "$HG_IMAGE" >/dev/null 2>&1; then
-      sudo docker pull -q "$HG_IMAGE" >/dev/null || die "не удалось скачать образ $HG_IMAGE (сеть до ghcr.io?)"
-    fi
+    pull_image || die "не удалось скачать образ $HG_IMAGE (сеть до ghcr.io?)"
     if sudo docker inspect halogen >/dev/null 2>&1; then
       echo "останавливаю прежний halogen штатно (до 60 с)…"
       sudo docker update --restart=no halogen >/dev/null 2>&1 || true

@@ -1,0 +1,42 @@
+# Провайдер halogen для dsh (DeepSeek Harness): вставить в профиль внутрь
+#   - id: llm-pi-ai
+#     config:
+#       providers:
+#         <сюда, с тем же отступом, что у соседних провайдеров>
+# Проверено загрузчиком dsh 0.2.2-rc.1 (--dump-config, схема плагина dsh-llm-pi-ai) и на макете halogen 0.20.1.
+#
+# Ключ: строка HALOGEN_API_KEY=<содержимое ~/ai395/halogen.key с бокса> в ~/.dsh/.env (права 600)
+#   или ввести в окне Settings → Models (тогда он хранится в .credentials.yaml и важнее .env).
+# Важно:
+#   - опечатки в именах полей dsh МОЛЧА пропускает (streamIdleTimeout вместо streamIdleTimeoutMs = 300000) — копируй как есть;
+#   - reasoning: — ИМЯ объявленного уровня (low/medium/high), не «xhigh»: иначе каждый запрос «По умолчанию» падает;
+#   - halogen ведёт 4 запроса одновременно; пятый ждёт без заголовков и рвётся через 300 с.
+#     Много параллельных сессий/субагентов — на боксе HG_EXTRA_ENV="HALOGEN_KV_SLOTS=8" и ./setup-ai395.sh halogen.
+      halogen:
+        displayName: halogen (бокс)
+        apiKeyEnv: HALOGEN_API_KEY
+        api: openai-responses              # или openai-completions — оба пути halogen поддерживает
+        baseURL: http://<IP_БОКСА>:8731/v1 # или http://<имя-бокса>.local:8731/v1, если IP меняется
+        reasoning: medium                  # «По умолчанию» = Medium (быстрее); High → xhigh — умолчание модели
+        streamIdleTimeoutMs: 1800000       # холодный промпт 256K читается минуты; keepalive halogen этот счётчик не сбрасывает
+        maxRequestImageBytes: 6291456
+        requestImagePixelBudget: 2073600
+        requestImageMaxBytes: 524288
+        retryPolicy:
+          mode: normal
+          maxRetries: 2                    # каждый повтор после обрыва в префилле — снова чтение всего промпта
+          retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT]
+          backoff: { initialDelayMs: 1000, maxDelayMs: 30000, jitterRatio: 0.2 }
+        models:
+          - id: halogen-qwen3.8-flash-next
+            name: halogen-qwen3.8-flash-next
+            contextWindow: 262144          # HALOGEN_CTX по умолчанию; prompt + max_tokens должно быть меньше
+            maxTokens: 32768               # ≤ половины окна (правило dsh); без него halogen даёт 8192 на мысли+ответ
+            input: [text, image]           # vision включён (HALOGEN_VISION_TOWER=1)
+            reasoningEfforts:              # шаблон Qwen знает три уровня: low, medium и xhigh; none — без размышлений
+              off: none
+              low: low
+              medium: medium
+              high: xhigh
+            compat:
+              supportsDeveloperRole: false

@@ -25,7 +25,7 @@ eval "$_env_saved"; unset _env_saved
 : "${AMD_IOMMU_OFF:=1}" "${SWAP_GB:=32}" "${DISABLE_ZSWAP:=1}" "${ENGINE:=halogen}"
 : "${HG_IMAGE:=ghcr.io/peonist-ai/halogen-flash-server:0.20.1}" "${HG_PUBLISH:=0.0.0.0:8731}" "${HG_API_KEY:=1}"
 : "${HG_WEIGHTS_REPO:=peonist-ai/halogen-qwen3.8-flash-next}" "${HG_EXTRA_ENV:=}" "${HG_MODEL:=fast}"
-: "${HF_HUB_PIN:=huggingface_hub==1.17.0}"
+: "${HF_HUB_PIN:=huggingface_hub==1.17.0}" "${HF_MAX_ATTEMPTS:=20}" "${HF_RETRY_SLEEP:=30}"
 : "${LLAMA_REPO:=https://github.com/ggml-org/llama.cpp.git}" "${LLAMA_REF:=b11627}"
 : "${MODEL_REPO:=mradermacher/Qwen3.8-Flash-Next-Uncensored-i1-GGUF}"
 : "${MODEL_FILE:=Qwen3.8-Flash-Next-Uncensored.i1-IQ4_XS.gguf}"
@@ -73,7 +73,8 @@ apt_try() {
 # поэтому без поддержки метки шаг halogen после неё упал бы на запросе пароля, пока никого нет рядом.
 sudo_keepalive() {
   sudo -v || die "нужен sudo"
-  ( while kill -0 "$$" 2>/dev/null; do sudo -n -v 2>/dev/null || true; sleep 60; done ) &
+  # вывод — в /dev/null: иначе осиротевший sleep держит stdout, и `скрипт | less` висит до 60 с после конца
+  ( while kill -0 "$$" 2>/dev/null; do sudo -n -v 2>/dev/null || true; sleep 60; done ) >/dev/null 2>&1 &
   SUDO_KA_PID=$!
   trap 'kill "$SUDO_KA_PID" 2>/dev/null || true' EXIT
 }
@@ -99,39 +100,70 @@ ensure_tools_venv() {
   ensure_uv
   [[ -x "$TOOLS_VENV/bin/python" ]] || uv venv -q --python "$TORCH_PYTHON" "$TOOLS_VENV"
   uv pip install -q --python "$TOOLS_VENV/bin/python" "$HF_HUB_PIN" gguf numpy
+  write_hf_wrapper "$TOOLS_VENV"
+}
+
+# Без xet huggingface_hub отказывается НАЧИНАТЬ загрузку файлов больше 50 ГБ (v2 66,7 ГБ, ngram 51,2 ГБ,
+# Uncensored GGUF 97,5 ГБ), хотя сервер их отдаёт и докачивает по Range. Обёртка снимает предел и зовёт обычный CLI.
+write_hf_wrapper() {
+  local v=$1
+  mkdir -p "$v/libexec"
+  cat > "$v/libexec/hf" <<EOF
+#!$v/bin/python
+import sys
+import huggingface_hub.constants as c
+c.MAX_HTTP_DOWNLOAD_SIZE = 1 << 62
+from huggingface_hub.cli.hf import main
+sys.exit(main())
+EOF
+  chmod +x "$v/libexec/hf"
 }
 
 # 2.x при обрыве оставлял <hash>.<etag>.<uuid8>.incomplete, которые никто не докачивает и не удаляет
 clean_hf_orphans() {
   local d="$MODEL_DIR/.cache/huggingface/download" f
   [[ -d "$d" ]] || return 0
-  if pgrep -u "$(id -u)" -f 'hf download' >/dev/null; then return 0; fi   # кто-то качает прямо сейчас
+  if pgrep -u "$(id -u)" -f '(bin|libexec)/hf download' >/dev/null; then return 0; fi   # кто-то качает прямо сейчас
   while IFS= read -r -d '' f; do
-    if [[ "$(basename "$f")" =~ \.[0-9a-f]{8}\.incomplete$ ]]; then rm -f "$f"; fi
+    # уборка мусора не должна ронять установку (файл мог оставить root из контейнера)
+    if [[ "$(basename "$f")" =~ \.[0-9a-f]{8}\.incomplete$ ]]; then rm -f "$f" 2>/dev/null || true; fi
   done < <(find "$d" -name '*.incomplete' -print0 2>/dev/null)
   return 0
 }
 
 # hf download с понятным прогрессом: «скачано X из Y ГиБ · скорость · осталось ~N мин» раз в 20 с.
+# Обрыв сети за многочасовую загрузку — не повод бросать: до HF_MAX_ATTEMPTS попыток с докачкой с того же места;
+# три попытки подряд без прибавки на диске (нет сети, диск полон, неверный репозиторий) — стоп.
 # Ctrl+C / закрытие окна останавливают и загрузку; повторный запуск докачает с того же места.
 hf_get() {
   local repo=$1; shift
-  clean_hf_orphans
-  HF_HUB_DISABLE_XET=1 HF_HUB_DISABLE_PROGRESS_BARS=1 \
-    "$TOOLS_VENV/bin/hf" download "$repo" "$@" --local-dir "$MODEL_DIR" &
-  local dl=$!
-  local st="$LOG_DIR/download.status"
+  local hf=${AI395_HF_CMD:-$TOOLS_VENV/libexec/hf}   # AI395_HF_CMD — подмена для тестов
+  local st="$LOG_DIR/download.status" attempt=1 noprog=0 rc before after dl mon
   mkdir -p "$LOG_DIR"
-  DL_STATUS_FILE="$st" "$TOOLS_VENV/bin/python" "$SCRIPT_DIR/dl_progress.py" "$repo" "$MODEL_DIR" "$dl" "$@" &
-  local mon=$!
-  trap "kill $dl $mon 2>/dev/null; rm -f '$st'; echo; echo 'прервано — запусти ещё раз, докачает с того же места'; exit 130" INT TERM HUP
-  local rc=0
-  wait "$dl" || rc=$?
-  kill "$mon" 2>/dev/null || true   # индикатор мог уже выйти сам
-  wait "$mon" 2>/dev/null || true
-  trap - INT TERM HUP
-  rm -f "$st"
-  ((rc == 0)) || die "загрузка $repo прервалась (код $rc) — запусти ещё раз, докачает с того же места"
+  clean_hf_orphans
+  while :; do
+    before=$( (du -sk "$MODEL_DIR" 2>/dev/null || echo 0) | awk '{print $1+0}')
+    HF_HUB_DISABLE_XET=1 HF_HUB_DISABLE_PROGRESS_BARS=1 "$hf" download "$repo" "$@" --local-dir "$MODEL_DIR" &
+    dl=$!
+    DL_STATUS_FILE="$st" "$TOOLS_VENV/bin/python" "$SCRIPT_DIR/dl_progress.py" "$repo" "$MODEL_DIR" "$dl" "$@" &
+    mon=$!
+    trap "kill $dl $mon 2>/dev/null; rm -f '$st'; echo; echo 'прервано — запусти ещё раз, докачает с того же места'; exit 130" INT TERM HUP
+    rc=0
+    wait "$dl" || rc=$?
+    kill "$mon" 2>/dev/null || true   # индикатор мог уже выйти сам
+    wait "$mon" 2>/dev/null || true
+    rm -f "$st"
+    if ((rc == 0)); then trap - INT TERM HUP; return 0; fi
+    after=$( (du -sk "$MODEL_DIR" 2>/dev/null || echo 0) | awk '{print $1+0}')
+    if (( after > before )); then noprog=0; else noprog=$((noprog + 1)); fi
+    if (( attempt >= HF_MAX_ATTEMPTS || noprog >= 3 )); then
+      trap - INT TERM HUP
+      die "загрузка $repo не идёт (код $rc, попыток: $attempt) — проверь сеть и место на диске и запусти ещё раз: докачает с того же места"
+    fi
+    warn "загрузка оборвалась (код $rc) — повтор $((attempt + 1)) из $HF_MAX_ATTEMPTS через ${HF_RETRY_SLEEP} с, докачает с того же места"
+    attempt=$((attempt + 1))
+    sleep "$HF_RETRY_SLEEP"
+  done
 }
 
 # Какую модель держит halogen: выбор из ./halogen-fast.sh важнее конфига
@@ -625,9 +657,11 @@ do_halogen() {
   )
   local cfg_hash cur
   cfg_hash=$(printf '%s\n' "$HG_IMAGE" "${run_args[@]}" | sha256sum | cut -c1-16)
-  cur=$(sudo docker inspect -f '{{index .Config.Labels "ai395.config"}} {{.State.Status}}' halogen 2>/dev/null || true)
-
-  if [[ "$cur" == "$cfg_hash running" ]]; then
+  cur=$(sudo docker inspect -f '{{index .Config.Labels "ai395.config"}} {{.State.Status}} {{.RestartCount}}' halogen 2>/dev/null || true)
+  # Docker не обнуляет счётчик перезапусков до reboot/docker start: падением считаем только НОВЫЙ перезапуск
+  local rc0=0
+  if [[ "${cur% *}" == "$cfg_hash running" ]]; then
+    rc0=${cur##* }
     ok "halogen уже работает с этой конфигурацией — не перезапускаю"
   else
     pull_image || die "не удалось скачать образ $HG_IMAGE (сеть до ghcr.io?)"
@@ -659,7 +693,7 @@ do_halogen() {
     fi
     # при --restart unless-stopped .State.Running «true» даже в петле перезапусков — смотрим статус и счётчик
     st=$(sudo docker inspect -f '{{.State.Status}} {{.RestartCount}}' halogen 2>/dev/null || echo "нет-контейнера 0")
-    if [[ "$st" != "running 0" ]]; then
+    if [[ "$st" != "running $rc0" ]]; then
       sudo docker logs --tail 60 halogen 2>&1 || true
       sudo docker update --restart=no halogen >/dev/null 2>&1 || true
       sudo docker stop -t 60 halogen >/dev/null 2>&1 || true
@@ -667,7 +701,8 @@ do_halogen() {
     fi
     sleep 5
   done
-  warn "за 15 минут /health не ответил, хотя контейнер работает — смотри: sudo docker logs -f halogen"
+  sudo docker logs --tail 30 halogen 2>&1 || true
+  warn "за 15 минут /health не ответил, хотя контейнер работает — лог выше; дальше: sudo docker logs -f halogen"
 }
 
 # ── 6. Ollama ────────────────────────────────────────────────────────
@@ -713,6 +748,7 @@ EOF
   else
     sudo systemctl disable --now ollama >/dev/null 2>&1 || true
     ok "ollama установлена, но сама не запускается: halogen занимает почти всю память"
+    echo "   после обновления Ollama её install.sh снова включает автозапуск — тогда повтори ./setup-ai395.sh ollama"
     echo "   запустить:      sudo docker stop -t 60 halogen && sudo systemctl start ollama"
     echo "   вернуть halogen: sudo systemctl stop ollama && sudo docker start halogen"
   fi
@@ -799,6 +835,8 @@ do_verify() (
     echo "halo-coder: не запущен"
   fi
   if systemctl is-active -q ollama; then echo "ollama: $(ollama --version 2>/dev/null | tail -1)"
+  elif have ollama && [[ "$ENGINE" == halogen ]]; then
+    echo "ollama: установлена, автозапуск выключен (halogen держит память). По очереди: sudo docker stop -t 60 halogen && sudo systemctl start ollama"
   elif have ollama; then echo "ollama: установлена, не запущена (sudo systemctl start ollama)"
   else echo "ollama: не установлена"; fi
   if [[ -x "$TORCH_VENV/bin/python" ]]; then

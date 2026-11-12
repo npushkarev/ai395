@@ -18,7 +18,7 @@ _env_saved=$(export -p)
 [[ -f "$SCRIPT_DIR/ai395.conf" ]] && source "$SCRIPT_DIR/ai395.conf"
 eval "$_env_saved"; unset _env_saved
 : "${AI_HOME:=$HOME/ai395}" "${MODEL_DIR:=$HOME/models/qwen38unc}" "${TORCH_PYTHON:=3.12}"
-: "${HG_WEIGHTS_REPO:=peonist-ai/halogen-qwen3.8-flash-next}" "${HF_HUB_PIN:=huggingface_hub==1.17.0}"
+: "${HG_WEIGHTS_REPO:=peonist-ai/halogen-qwen3.8-flash-next}" "${HF_HUB_PIN:=huggingface_hub==1.17.0}" "${HF_MAX_ATTEMPTS:=20}" "${HF_RETRY_SLEEP:=30}"
 
 # v2 + таблица n-грамм + драфт-голова (нужна при переключении на GGUF) + vision-башня (картинки) + токенайзер
 FILES=(
@@ -42,7 +42,8 @@ die()  { echo $'\e[31m✗' "$*"$'\e[0m' >&2; exit 1; }
 # без поддержки метки переключение halogen после неё упало бы на запросе пароля.
 sudo_keepalive() {
   sudo -v || die "нужен sudo"
-  ( while kill -0 "$$" 2>/dev/null; do sudo -n -v 2>/dev/null || true; sleep 60; done ) &
+  # вывод — в /dev/null: иначе осиротевший sleep держит stdout, и `скрипт | less` висит до 60 с после конца
+  ( while kill -0 "$$" 2>/dev/null; do sudo -n -v 2>/dev/null || true; sleep 60; done ) >/dev/null 2>&1 &
   SUDO_KA_PID=$!
   trap 'kill "$SUDO_KA_PID" 2>/dev/null || true' EXIT
 }
@@ -54,15 +55,33 @@ ensure_hf() {
   command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
   [[ -x "$VENV/bin/python" ]] || uv venv -q --python "$TORCH_PYTHON" "$VENV"
   uv pip install -q --python "$VENV/bin/python" "$HF_HUB_PIN"
+  write_hf_wrapper "$VENV"
+}
+
+# Без xet huggingface_hub отказывается НАЧИНАТЬ загрузку файлов больше 50 ГБ (v2 66,7 ГБ, ngram 51,2 ГБ,
+# Uncensored GGUF 97,5 ГБ), хотя сервер их отдаёт и докачивает по Range. Обёртка снимает предел и зовёт обычный CLI.
+write_hf_wrapper() {
+  local v=$1
+  mkdir -p "$v/libexec"
+  cat > "$v/libexec/hf" <<EOF
+#!$v/bin/python
+import sys
+import huggingface_hub.constants as c
+c.MAX_HTTP_DOWNLOAD_SIZE = 1 << 62
+from huggingface_hub.cli.hf import main
+sys.exit(main())
+EOF
+  chmod +x "$v/libexec/hf"
 }
 
 # 2.x при обрыве оставлял <hash>.<etag>.<uuid8>.incomplete, которые никто не докачивает и не удаляет
 clean_hf_orphans() {
   local d="$MODEL_DIR/.cache/huggingface/download" f
   [[ -d "$d" ]] || return 0
-  if pgrep -u "$(id -u)" -f 'hf download' >/dev/null; then return 0; fi   # кто-то качает прямо сейчас
+  if pgrep -u "$(id -u)" -f '(bin|libexec)/hf download' >/dev/null; then return 0; fi   # кто-то качает прямо сейчас
   while IFS= read -r -d '' f; do
-    if [[ "$(basename "$f")" =~ \.[0-9a-f]{8}\.incomplete$ ]]; then rm -f "$f"; fi
+    # уборка мусора не должна ронять установку (файл мог оставить root из контейнера)
+    if [[ "$(basename "$f")" =~ \.[0-9a-f]{8}\.incomplete$ ]]; then rm -f "$f" 2>/dev/null || true; fi
   done < <(find "$d" -name '*.incomplete' -print0 2>/dev/null)
   return 0
 }
@@ -77,24 +96,38 @@ fix_ownership() {
 }
 
 # hf download с понятным прогрессом: «скачано X из Y ГиБ · скорость · осталось ~N мин» раз в 20 с.
+# Обрыв сети за многочасовую загрузку — не повод бросать: до HF_MAX_ATTEMPTS попыток с докачкой с того же места;
+# три попытки подряд без прибавки на диске (нет сети, диск полон, неверный репозиторий) — стоп.
 # Ctrl+C / закрытие окна останавливают и загрузку; повторный запуск докачает с того же места.
 hf_get() {
   local repo=$1; shift
-  HF_HUB_DISABLE_XET=1 HF_HUB_DISABLE_PROGRESS_BARS=1 \
-    "$VENV/bin/hf" download "$repo" "$@" --local-dir "$MODEL_DIR" &
-  local dl=$!
-  local st="$LOG_DIR/download.status"
+  local hf=${AI395_HF_CMD:-$VENV/libexec/hf}   # AI395_HF_CMD — подмена для тестов
+  local st="$LOG_DIR/download.status" attempt=1 noprog=0 rc before after dl mon
   mkdir -p "$LOG_DIR"
-  DL_STATUS_FILE="$st" "$VENV/bin/python" "$SCRIPT_DIR/dl_progress.py" "$repo" "$MODEL_DIR" "$dl" "$@" &
-  local mon=$!
-  trap "kill $dl $mon 2>/dev/null; rm -f '$st'; echo; echo 'прервано — запусти ещё раз, докачает с того же места'; exit 130" INT TERM HUP
-  local rc=0
-  wait "$dl" || rc=$?
-  kill "$mon" 2>/dev/null || true   # индикатор мог уже выйти сам
-  wait "$mon" 2>/dev/null || true
-  trap - INT TERM HUP
-  rm -f "$st"
-  ((rc == 0)) || die "загрузка $repo прервалась (код $rc) — запусти ещё раз, докачает с того же места"
+  clean_hf_orphans
+  while :; do
+    before=$( (du -sk "$MODEL_DIR" 2>/dev/null || echo 0) | awk '{print $1+0}')
+    HF_HUB_DISABLE_XET=1 HF_HUB_DISABLE_PROGRESS_BARS=1 "$hf" download "$repo" "$@" --local-dir "$MODEL_DIR" &
+    dl=$!
+    DL_STATUS_FILE="$st" "$VENV/bin/python" "$SCRIPT_DIR/dl_progress.py" "$repo" "$MODEL_DIR" "$dl" "$@" &
+    mon=$!
+    trap "kill $dl $mon 2>/dev/null; rm -f '$st'; echo; echo 'прервано — запусти ещё раз, докачает с того же места'; exit 130" INT TERM HUP
+    rc=0
+    wait "$dl" || rc=$?
+    kill "$mon" 2>/dev/null || true   # индикатор мог уже выйти сам
+    wait "$mon" 2>/dev/null || true
+    rm -f "$st"
+    if ((rc == 0)); then trap - INT TERM HUP; return 0; fi
+    after=$( (du -sk "$MODEL_DIR" 2>/dev/null || echo 0) | awk '{print $1+0}')
+    if (( after > before )); then noprog=0; else noprog=$((noprog + 1)); fi
+    if (( attempt >= HF_MAX_ATTEMPTS || noprog >= 3 )); then
+      trap - INT TERM HUP
+      die "загрузка $repo не идёт (код $rc, попыток: $attempt) — проверь сеть и место на диске и запусти ещё раз: докачает с того же места"
+    fi
+    warn "загрузка оборвалась (код $rc) — повтор $((attempt + 1)) из $HF_MAX_ATTEMPTS через ${HF_RETRY_SLEEP} с, докачает с того же места"
+    attempt=$((attempt + 1))
+    sleep "$HF_RETRY_SLEEP"
+  done
 }
 
 download() {
@@ -107,6 +140,7 @@ download() {
   if ((missing == 0)); then ok "быстрая модель уже скачана: $MODEL_DIR"; return 0; fi
 
   fix_ownership
+  clean_hf_orphans   # ещё раз: после chown удалится и то, что оставил root
   # сколько ещё докачать: размер минус готовые файлы и недокачанные куски
   local have_gib part_gib need_gib avail_gib
   have_gib=$( (du -scBG "$MODEL_DIR"/qwen38-flash-next-{v2,ngram}.hgn 2>/dev/null || true) | awk '$2=="total"{print $1+0}')
@@ -160,7 +194,7 @@ case "${1:-all}" in
     # Пока идёт загрузка (в этом или другом терминале), её индикатор пишет последнюю строку в файл
     st="$LOG_DIR/download.status"
     [[ -x "$VENV/bin/python" ]] || ensure_hf >/dev/null 2>&1
-    if pgrep -u "$(id -u)" -f 'hf download' >/dev/null; then
+    if pgrep -u "$(id -u)" -f '(bin|libexec)/hf download' >/dev/null; then
       if [[ -s "$st" ]]; then cat "$st"
       else "$VENV/bin/python" "$SCRIPT_DIR/dl_progress.py" "$HG_WEIGHTS_REPO" "$MODEL_DIR" 0 "${FILES[@]}"; fi
     else

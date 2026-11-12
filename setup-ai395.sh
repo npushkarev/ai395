@@ -23,7 +23,7 @@ eval "$_env_saved"; unset _env_saved
 # Значения по умолчанию, если конфига нет
 : "${AI_HOME:=$HOME/ai395}" "${MODEL_DIR:=$HOME/models/qwen38unc}" "${OLLAMA_MODELS_DIR=}"
 : "${AMD_IOMMU_OFF:=1}" "${SWAP_GB:=32}" "${DISABLE_ZSWAP:=1}" "${ENGINE:=halogen}"
-: "${HG_IMAGE:=ghcr.io/peonist-ai/halogen-flash-server:0.20.1}" "${HG_PUBLISH:=0.0.0.0:8731}" "${HG_API_KEY:=1}"
+: "${HG_IMAGE:=ghcr.io/peonist-ai/halogen-flash-server:0.20.4}" "${HG_PUBLISH:=0.0.0.0:8731}" "${HG_API_KEY:=1}"
 : "${HG_WEIGHTS_REPO:=peonist-ai/halogen-qwen3.8-flash-next}" "${HG_EXTRA_ENV:=}" "${HG_MODEL:=fast}"
 : "${HF_HUB_PIN:=huggingface_hub==1.17.0}" "${HF_MAX_ATTEMPTS:=20}" "${HF_RETRY_SLEEP:=30}"
 : "${LLAMA_REPO:=https://github.com/ggml-org/llama.cpp.git}" "${LLAMA_REF:=b11627}"

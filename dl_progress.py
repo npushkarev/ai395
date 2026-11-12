@@ -2,16 +2,17 @@
 """Сколько осталось докачать с Hugging Face в --local-dir.
 
   dl_progress.py <repo> <local_dir> <pid> <файл>...   # печатать раз в 20 с, пока жив процесс pid
-  dl_progress.py <repo> <local_dir> 0 <файл>...       # один замер по файлам на диске и выход
+  dl_progress.py <repo> <local_dir> 0 <файл>...       # загрузка идёт: замер скорости за 10 с и выход
+  dl_progress.py <repo> <local_dir> -1 <файл>...      # загрузка не идёт: сколько уже лежит на диске
 
-Готовое = целые файлы + недокачанные куски в <local_dir>/.cache/huggingface/download.
-hf_xet копит данные в памяти и пишет блоками, поэтому пока жив процесс загрузки, к тому, что
-было на диске в начале, прибавляется принятое сетевыми картами (/proc/net/dev, только Linux;
-на выделенном боксе это почти целиком наша загрузка).
+Готовое = целые файлы + недокачанные куски <hash>.<etag>.incomplete в <local_dir>/.cache/huggingface/download.
+Скрипты качают без xet (HF_HUB_DISABLE_XET=1), поэтому .incomplete растёт по мере загрузки и счёт точный.
+Сироты huggingface_hub 2.x (<hash>.<etag>.<uuid8>.incomplete) не считаются: их никто не докачивает.
 Если задан DL_STATUS_FILE, последняя строка пишется ещё и туда (для `halogen-fast.sh progress`).
 """
 import glob
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -20,6 +21,7 @@ from huggingface_hub import HfApi
 
 INTERVAL = 20
 GIB = 2 ** 30
+ORPHAN = re.compile(r"\.[0-9a-f]{8}\.incomplete$")
 
 
 def main() -> int:
@@ -37,7 +39,15 @@ def main() -> int:
 
         def partial(f: str) -> int:
             pattern = str(get_local_download_paths(local, f).incomplete_path("*"))
-            return sum(os.stat(x).st_blocks * 512 for x in glob.glob(pattern))
+            s = 0
+            for x in glob.glob(pattern):
+                if ORPHAN.search(x):
+                    continue
+                try:
+                    s += os.stat(x).st_blocks * 512
+                except OSError:  # файл переименовали между glob и stat — значит, он уже готов
+                    pass
+            return s
     except Exception:
         def partial(f: str) -> int:
             return 0
@@ -46,26 +56,14 @@ def main() -> int:
         s = 0
         for f, size in sizes.items():
             p = local / f
-            if p.exists() and p.stat().st_size == size:
-                s += size
-            else:
-                s += min(partial(f), size)
+            try:
+                if p.stat().st_size == size:
+                    s += size
+                    continue
+            except OSError:
+                pass
+            s += min(partial(f), size)
         return s
-
-    def received() -> int | None:
-        # rx-байты всех физических/беспроводных интерфейсов (без lo, docker, veth, мостов)
-        try:
-            total_rx = 0
-            with open("/proc/net/dev") as fh:
-                for row in fh.readlines()[2:]:
-                    name, data = row.split(":", 1)
-                    name = name.strip()
-                    if name == "lo" or name.startswith(("docker", "veth", "br-", "virbr", "tailscale", "wg")):
-                        continue
-                    total_rx += int(data.split()[0])
-            return total_rx
-        except (OSError, ValueError, IndexError):
-            return None
 
     def alive() -> bool:
         try:
@@ -74,10 +72,12 @@ def main() -> int:
         except OSError:
             return False
 
-    def line(d: int, speed: float) -> str:
+    def line(d: int, speed: float, idle: bool = False) -> str:
         out = f"⏬ скачано {d / GIB:6.1f} из {total / GIB:.1f} ГиБ ({100 * d / max(total, 1):4.1f}%)"
         if d >= total:
             return out + " · готово"
+        if idle:
+            return out + " · загрузка сейчас не идёт (запусти ./halogen-fast.sh download — докачает)"
         if speed > 50 * 1024:
             h, m = divmod(int((total - d) / speed // 60), 60)
             out += f" · {speed / 2**20:5.1f} МБ/с · осталось ~{f'{h} ч ' if h else ''}{m} мин"
@@ -93,28 +93,22 @@ def main() -> int:
             except OSError:
                 pass
 
+    if pid == -1:
+        print(line(on_disk(), 0, idle=True), flush=True)
+        return 0
     if pid == 0:
         a = on_disk(); time.sleep(10); b = on_disk()
         print(line(b, (b - a) / 10), flush=True)
         return 0
 
-    base_disk, base_net = on_disk(), received()
-
-    def done() -> int:
-        d = on_disk()
-        net = received()
-        if base_net is not None and net is not None:
-            d = max(d, base_disk + net - base_net)
-        return min(d, total)
-
-    history = [(time.time(), done())]
+    history = [(time.time(), on_disk())]
     while alive():
         time.sleep(INTERVAL)
-        now, d = time.time(), done()
+        now, d = time.time(), on_disk()
         history = (history + [(now, d)])[-4:]  # скорость за последнюю минуту
         t0, d0 = history[0]
         emit(line(d, (d - d0) / max(now - t0, 1)))
-        if on_disk() >= total:
+        if d >= total:
             break
     return 0
 

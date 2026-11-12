@@ -1,3 +1,10 @@
 __pycache__/
 *.pyc
 .DS_Store
+# если репозиторий склонирован прямо в ~/ai395 (= AI_HOME), сюда же пишутся рабочие файлы — не публиковать
+halogen.key
+halogen.choice
+logs/
+bin/
+src/
+venv-*/

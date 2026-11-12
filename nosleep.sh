@@ -9,7 +9,7 @@
 # Запускать обычным пользователем из графической сессии (sudo спросит сам).
 set -Eeuo pipefail
 # Ни одна ошибка не должна проходить молча: печатаем, где и что упало
-trap 'echo "✗ ошибка: строка $LINENO: $BASH_COMMAND" >&2' ERR
+trap 'rc=$?; ((rc == 130)) || echo "✗ ошибка (код $rc): строка $LINENO: $BASH_COMMAND" >&2' ERR
 
 TARGETS=(sleep.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target)
 LOGIND_CONF=/etc/systemd/logind.conf.d/90-ai395-nosleep.conf
